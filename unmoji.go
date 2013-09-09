@@ -23,11 +23,11 @@ func init() {
 }
 
 var (
-	flag_encs    = flag.String("encs", "utf-8", "Comma-separated encoding path")
-	flag_args    = flag.Bool("args", false, "Decode arguments instead of from STDIN")
-	flag_rename  = flag.Bool("rename", false, "Like args but rename the named files to the decoded values")
-	flag_really  = flag.Bool("really", false, "When -rename is given, actually do the renaming instead of just showing what will happen")
-	flag_force   = flag.Bool("f", false, "Skip errors")
+	flag_encs   = flag.String("encs", "utf-8", "Comma-separated encoding path")
+	flag_args   = flag.Bool("args", false, "Decode arguments instead of from STDIN")
+	flag_rename = flag.Bool("rename", false, "Like args but rename the named files to the decoded values")
+	flag_really = flag.Bool("really", false, "When -rename is given, actually do the renaming instead of just showing what will happen")
+	flag_force  = flag.Bool("f", false, "Skip errors")
 	//flag_recurse = flag.Bool("r", false, "When -rename is given, perform renaming recursively through the given directories (THIS IS REALLY DANGEROUS)")
 )
 
@@ -107,28 +107,32 @@ func decode_args(encs []mojibake.Encoding) int {
 
 	dec.Close()
 
-	if *flag_rename {
-		if *flag_really {
-			for i, filename := range input {
-				if filename == decoded[i] && !*flag_force {
-					fmt.Fprintf(os.Stderr, "unmoji: rename \"%s\": source and destination are the same\n", filename)
-					return 1
-				}
-
-				err := os.Rename(filename, decoded[i])
-				if err != nil && !*flag_force {
-					fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
-					return 1
-				}
-			}
-		} else {
-			for i, filename := range input {
-				fmt.Printf("\"%s\" → \"%s\"\n", filename, decoded[i])
-			}
-		}
-	} else {
+	if !*flag_rename {
 		for _, s := range decoded {
 			fmt.Println(s)
+		}
+
+		return 0
+	}
+
+	if !*flag_really {
+		for i, filename := range input {
+			fmt.Printf("\"%s\" → \"%s\"\n", filename, decoded[i])
+		}
+
+		return 0
+	}
+
+	for i, filename := range input {
+		if filename == decoded[i] && !*flag_force {
+			fmt.Fprintf(os.Stderr, "unmoji: rename \"%s\": source and destination are the same\n", filename)
+			return 1
+		}
+
+		err := os.Rename(filename, decoded[i])
+		if err != nil && !*flag_force {
+			fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
+			return 1
 		}
 	}
 
