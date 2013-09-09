@@ -1,177 +1,154 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"github.com/moshee/mojibake"
 	"io"
 	"os"
-	"unicode/utf8"
+	"strings"
 )
-
-var (
-	flag_mode = flag.String("mode", "", "Source encoding ('' (convert), 'sjis', 'utf8', 'cjk')")
-	flag_out  = flag.String("o", "", "Output to file instead of STDOUT")
-)
-
-func errorf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format, args...)
-	os.Exit(1)
-}
 
 func init() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage: %s [OPTIONS] [infile]
-If no input file is given, reads from STDIN.
-Options:
-`, os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, `Available encoding options for -encs:
+    utf-8, utf8, cp473: CP473 (assume UTF-8 input misinterpreted as ASCII)
+    sjis, shift-jis, cp932: CP932 (assume Shift-JIS input misinterpreted as UTF-8)
+    cjk, cp936: CP936 (assume CJK input misinterpreted as UTF-8)
+`)
 	}
+}
+
+var (
+	flag_encs    = flag.String("encs", "utf-8", "Comma-separated encoding path")
+	flag_args    = flag.Bool("args", false, "Decode arguments instead of from STDIN")
+	flag_rename  = flag.Bool("rename", false, "Like args but rename the named files to the decoded values")
+	flag_really  = flag.Bool("really", false, "When -rename is given, actually do the renaming instead of just showing what will happen")
+	flag_force   = flag.Bool("f", false, "Skip errors")
+	//flag_recurse = flag.Bool("r", false, "When -rename is given, perform renaming recursively through the given directories (THIS IS REALLY DANGEROUS)")
+)
+
+var enc_map = map[string]mojibake.Encoding{
+	"utf-8":     mojibake.CP473,
+	"utf8":      mojibake.CP473,
+	"cp473":     mojibake.CP473,
+	"sjis":      mojibake.CP932,
+	"shift-jis": mojibake.CP932,
+	"cp932":     mojibake.CP932,
+	"cjk":       mojibake.CP936,
+	"cp936":     mojibake.CP936,
 }
 
 func main() {
 	flag.Parse()
 
-	var err error
-	var infile *os.File
-	if flag.NArg() == 0 {
-		infile = os.Stdin
-	} else {
-		infile, err = os.Open(flag.Arg(0))
-		if err != nil {
-			errorf("%s\n", err.Error())
-		}
-	}
-
-	var outfile *os.File
-	if len(*flag_out) == 0 {
-		outfile = os.Stdout
-	} else {
-		outfile, err = os.Create(*flag_out)
-		if err != nil {
-			errorf("%s\n", err.Error())
-		}
-	}
-
-	var w io.Writer
-	switch *flag_mode {
-	case "":
-		w = mojibake.SJISDecoder{outfile}
-	case "utf8":
-		w = mojibake.UTF8Decoder{outfile}
-	case "cjk":
-		decode(infile, outfile, enc_cp936)
-		return
-	case "sjis":
-		decode(infile, outfile, enc_cp932)
-		return
-
-	default:
-		fmt.Fprintln(os.Stderr, "Unknown encoding:", *flag_mode)
-		flag.Usage()
+	if len(*flag_encs) == 0 {
+		fmt.Fprintln(os.Stderr, "unmoji: no encoding path given")
 		os.Exit(1)
 	}
+	enc_list := strings.Split(*flag_encs, ",")
+	encs := make([]mojibake.Encoding, 0, len(enc_list))
+	for _, enc_name := range enc_list {
+		if enc, ok := enc_map[enc_name]; ok {
+			encs = append(encs, enc)
+		} else {
+			fmt.Fprintf(os.Stderr, "unmoji: unknown encoding: %s\n", enc_name)
+			os.Exit(1)
+		}
+	}
 
-	io.Copy(w, infile)
+	if *flag_args || *flag_rename {
+		os.Exit(decode_args(encs))
+	} else {
+		os.Exit(decode_stdin(encs))
+	}
 }
 
-func decode(infile io.Reader, outfile *os.File, enc Encoding) {
-	var (
-		buf = make([]rune, 4096)
-		d   = new_decoder(infile, enc)
-		ch  rune
-		err error
-	)
-	for i := 0; ; i++ {
-		ch, _, err = d.ReadRune()
+func decode_args(encs []mojibake.Encoding) int {
+	if flag.NArg() == 0 {
+		return 0
+	}
+
+	buf := new(bytes.Buffer)
+	dec, err := mojibake.NewDecoder(buf, encs...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
+		return 1
+	}
+
+	decoded := make([]string, 0, flag.NArg())
+	args := flag.Args()
+
+	// need this in case any of them error and -f is given
+	// so we can selectively include input filenames
+	input := make([]string, 0, len(args))
+
+	for _, garbled := range args {
+		r := strings.NewReader(garbled)
+		io.Copy(dec, r)
+
+		_, err := dec.Flush()
 		if err != nil {
-			outfile.WriteString(string(buf[:i]))
-			break
+			if *flag_force {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
+			dec.Close()
+			return 1
 		}
-		if i >= len(buf) {
-			outfile.WriteString(string(buf))
-			i = 0
-		}
-		buf[i] = ch
+
+		p := buf.Next(buf.Len())
+		input = append(input, garbled)
+		decoded = append(decoded, string(p))
 	}
-}
 
-type Encoding int
+	dec.Close()
 
-const (
-	enc_cp932 Encoding = iota
-	enc_cp936
-)
+	if *flag_rename {
+		if *flag_really {
+			for i, filename := range input {
+				if filename == decoded[i] && !*flag_force {
+					fmt.Fprintf(os.Stderr, "unmoji: rename \"%s\": source and destination are the same\n", filename)
+					return 1
+				}
 
-type Decoder struct {
-	r     io.Reader
-	buf   []byte
-	ptr   int
-	err   error
-	table []rune
-}
-
-func new_decoder(r io.Reader, enc Encoding) (s *Decoder) {
-	s = new(Decoder)
-	s.r = r
-	switch enc {
-	case enc_cp932:
-		s.table = cp932[:]
-	case enc_cp936:
-		s.table = cp936[:]
-	default:
-		return nil
-	}
-	s.buf = make([]byte, 4096)
-	s.fill()
-	return
-}
-
-func (self *Decoder) fill() {
-	n, err := self.r.Read(self.buf)
-	self.buf = self.buf[:n]
-	self.err = err
-	self.ptr = 0
-}
-
-// Transparent Read function. Does no character transformation. Use ReadRune for actual decoding.
-func (self *Decoder) Read(p []byte) (n int, err error) {
-	n, err = self.r.Read(p)
-	self.ptr += n
-	return
-}
-
-func (self *Decoder) ReadByte() (byte, error) {
-	if self.ptr >= len(self.buf) {
-		if self.err == io.EOF {
-			return 0, self.err
+				err := os.Rename(filename, decoded[i])
+				if err != nil && !*flag_force {
+					fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
+					return 1
+				}
+			}
+		} else {
+			for i, filename := range input {
+				fmt.Printf("\"%s\" → \"%s\"\n", filename, decoded[i])
+			}
 		}
-		self.fill()
-		if self.err != nil {
-			return 0, self.err
+	} else {
+		for _, s := range decoded {
+			fmt.Println(s)
 		}
 	}
-	b := self.buf[self.ptr]
-	self.ptr++
-	return b, nil
+
+	return 0
 }
 
-func (self *Decoder) ReadRune() (rune, int, error) {
-	c1, err := self.ReadByte()
-	if err != nil {
-		return 0, 0, err
+func decode_stdin(encs []mojibake.Encoding) int {
+	decoder, err := mojibake.NewDecoder(os.Stdout, encs...)
+	if err != nil && !*flag_force {
+		fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
+		return 1
 	}
-	// converting begins here
-	if c1 < utf8.RuneSelf {
-		return rune(c1), 1, nil
-	}
-	// read up to 2 bytes (16 bits) for the 16-bit Shift-JIS character
-	c2, err := self.ReadByte()
-	if err != nil {
-		return utf8.RuneError, 1, err
-	}
-	// shift-jis is easy since every rune is either one or two bytes
-	ch := self.table[rune(c1)<<8|rune(c2)]
 
-	return ch, utf8.RuneLen(ch), nil
+	io.Copy(decoder, os.Stdin)
+
+	err = decoder.Close()
+	if err != nil && !*flag_force {
+		fmt.Fprintf(os.Stderr, "unmoji: %v\n", err)
+		return 1
+	}
+
+	return 0
 }
